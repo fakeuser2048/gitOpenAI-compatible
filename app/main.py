@@ -17,9 +17,7 @@ app = FastAPI(title="GitHub Copilot OpenAI-compatible API")
 
 # ---------- Config ----------
 GITHUB_TOKEN = os.getenv("GITHUB_COPILOT_TOKEN", "")
-if not GITHUB_TOKEN:
-    print("⚠️ WARNING: GITHUB_COPILOT_TOKEN is not set!")
-
+ADMIN_KEY = os.getenv("ADMIN_KEY", os.getenv("SERVER_API_KEY", ""))
 SERVER_API_KEY = os.getenv("SERVER_API_KEY", "")
 
 GITHUB_API_BASE = "https://api.individual.githubcopilot.com/github/chat"
@@ -101,13 +99,12 @@ async def send_message_stream(
     req = client.build_request("POST", url, headers=headers, json=body)
     return await client.send(req, stream=True)
 
-# ---------- Auth (ساده‌شده برای debug) ----------
+# ---------- Auth ----------
 async def verify_api_key(authorization: Optional[str] = Header(None)):
     if SERVER_API_KEY:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Missing or invalid API key")
-        token = authorization.split(" ", 1)[1]
-        if token != SERVER_API_KEY:
+        if authorization.split(" ", 1)[1] != SERVER_API_KEY:
             raise HTTPException(status_code=401, detail="Invalid API key")
     return True
 
@@ -129,14 +126,14 @@ async def root():
     return {
         "service": "GitHub Copilot OpenAI-compatible API",
         "token_set": bool(GITHUB_TOKEN),
-        "token_length": len(GITHUB_TOKEN),
+        "docs": "/docs",
+        "admin_token_status": "/admin/token-status"
     }
 
 @app.get("/debug/token")
 async def debug_token():
-    """تست توکن - احراز هویت نمی‌خواهد"""
     if not GITHUB_TOKEN:
-        return {"error": "GITHUB_COPILOT_TOKEN is empty or not set"}
+        return {"error": "GITHUB_COPILOT_TOKEN is empty"}
     
     headers = get_github_headers()
     token = headers["Authorization"]
@@ -144,25 +141,64 @@ async def debug_token():
     
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            resp = await client.post(
-                f"{GITHUB_API_BASE}/threads",
-                headers=headers,
-                json={}
-            )
+            resp = await client.post(f"{GITHUB_API_BASE}/threads", headers=headers, json={})
             return {
                 "status_code": resp.status_code,
                 "token_preview": masked,
                 "token_length": len(token),
-                "starts_with_bearer": token.startswith("GitHub-Bearer "),
-                "github_response": resp.text[:1000],
                 "success": resp.status_code == 200,
+                "github_response": resp.text[:500] if resp.status_code != 200 else "OK"
             }
         except Exception as e:
+            return {"error": str(e), "token_preview": masked}
+
+@app.get("/admin/token-status")
+async def token_status():
+    """بررسی وضعیت توکن - بدون احراز هویت اضافی"""
+    headers = get_github_headers()
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.post(f"{GITHUB_API_BASE}/threads", headers=headers, json={})
             return {
-                "error": str(e),
-                "token_preview": masked,
-                "token_length": len(token),
+                "is_valid": resp.status_code == 200,
+                "status_code": resp.status_code,
+                "message": "✅ Token is valid" if resp.status_code == 200 else f"❌ Token invalid"
             }
+        except Exception as e:
+            return {"is_valid": False, "error": str(e)}
+
+@app.post("/admin/update-token")
+async def update_token(
+    new_token: str = Header(..., alias="X-New-Token"),
+    admin_key: str = Header(..., alias="X-Admin-Key")
+):
+    """به‌روزرسانی توکن بدون redeploy"""
+    if not ADMIN_KEY:
+        raise HTTPException(status_code=500, detail="ADMIN_KEY or SERVER_API_KEY not configured")
+    
+    if admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    
+    if not new_token:
+        raise HTTPException(status_code=400, detail="Token is required")
+    
+    global GITHUB_TOKEN
+    GITHUB_TOKEN = new_token.strip()
+    
+    # تست توکن جدید
+    headers = get_github_headers()
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.post(f"{GITHUB_API_BASE}/threads", headers=headers, json={})
+            is_valid = resp.status_code == 200
+        except:
+            is_valid = False
+    
+    return {
+        "status": "updated",
+        "token_valid": is_valid,
+        "message": "✅ Token updated and valid" if is_valid else "⚠️ Token updated but validation failed"
+    }
 
 @app.get("/v1/models")
 async def list_models():
