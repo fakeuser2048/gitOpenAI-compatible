@@ -24,7 +24,6 @@ SERVER_API_KEY = os.getenv("SERVER_API_KEY", "")
 
 GITHUB_API_BASE = "https://api.individual.githubcopilot.com/github/chat"
 
-# Supported models
 SUPPORTED_MODELS = [
     "auto",
     "github-copilot",
@@ -37,7 +36,6 @@ SUPPORTED_MODELS = [
     "gemini-2.5-flash"
 ]
 
-# Thread state: thread_id -> last_assistant_message_id
 thread_state: Dict[str, str] = {}
 state_lock = Lock()
 
@@ -58,8 +56,12 @@ class ChatCompletionRequest(BaseModel):
 
 # ---------- Helpers ----------
 def get_github_headers() -> Dict[str, str]:
+    token = GITHUB_TOKEN.strip()
+    # اگر توکن با GitHub-Bearer شروع نشده، اضافه کن
+    if not token.startswith("GitHub-Bearer "):
+        token = f"GitHub-Bearer {token}"
     return {
-        "Authorization": f"GitHub-Bearer {GITHUB_TOKEN}",
+        "Authorization": token,
         "copilot-integration-id": "copilot-chat",
         "x-github-api-version": "2025-05-01",
         "Content-Type": "application/json",
@@ -70,7 +72,10 @@ async def create_thread(client: httpx.AsyncClient) -> str:
     headers = get_github_headers()
     resp = await client.post(url, headers=headers, json={})
     if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=f"Failed to create thread: {resp.text}")
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"Failed to create thread: {resp.text}"
+        )
     data = resp.json()
     return data["id"]
 
@@ -141,6 +146,17 @@ def openai_final_chunk() -> bytes:
     return b"data: [DONE]\n\n"
 
 # ---------- Routes ----------
+@app.get("/")
+async def root():
+    return {
+        "service": "GitHub Copilot OpenAI-compatible API",
+        "version": "1.0.0",
+        "endpoints": {
+            "models": "/v1/models",
+            "chat": "/v1/chat/completions"
+        }
+    }
+
 @app.get("/v1/models")
 async def list_models():
     models_data = [
@@ -154,10 +170,7 @@ async def list_models():
         {"id": "o4-mini", "object": "model", "created": 1720000000, "owned_by": "openai"},
         {"id": "gemini-2.5-flash", "object": "model", "created": 1719000000, "owned_by": "google"},
     ]
-    return {
-        "object": "list",
-        "data": models_data
-    }
+    return {"object": "list", "data": models_data}
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
@@ -169,7 +182,7 @@ async def chat_completions(
     if body.model not in SUPPORTED_MODELS:
         raise HTTPException(
             status_code=400,
-            detail=f"Model '{body.model}' not supported. Available models: {', '.join(SUPPORTED_MODELS)}"
+            detail=f"Model '{body.model}' not supported. Available: {', '.join(SUPPORTED_MODELS)}"
         )
 
     # Extract last user message
@@ -179,7 +192,6 @@ async def chat_completions(
     last_user_content = user_messages[-1].content
 
     async with httpx.AsyncClient(timeout=300.0) as client:
-        # Thread management
         thread_id = body.thread_id
         parent_id = "root"
         with state_lock:
@@ -192,17 +204,19 @@ async def chat_completions(
                 thread_state[thread_id] = "root"
             parent_id = "root"
 
-        # Generate unique IDs
         response_message_id = str(uuid.uuid4())
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
 
         try:
             resp = await send_message_stream(
                 client, thread_id, last_user_content, parent_id, response_message_id,
-                model=body.model  # Pass selected model
+                model=body.model
             )
             if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail=f"GitHub API error: {resp.text}")
+                raise HTTPException(
+                    status_code=resp.status_code,
+                    detail=f"GitHub API error: {resp.text}"
+                )
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"GitHub API request failed: {str(e)}")
 
@@ -246,7 +260,6 @@ async def chat_completions(
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
         else:
-            # Non-streaming
             full_content = []
             collected_assistant_id = None
             async for line in resp.aiter_lines():
@@ -275,29 +288,23 @@ async def chat_completions(
                     thread_state[thread_id] = collected_assistant_id
 
             final_text = "".join(full_content)
-            response_obj = {
+            return JSONResponse(content={
                 "id": completion_id,
                 "object": "chat.completion",
                 "created": int(__import__("time").time()),
                 "model": body.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": final_text,
-                        },
-                        "finish_reason": "stop",
-                    }
-                ],
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": final_text},
+                    "finish_reason": "stop",
+                }],
                 "usage": {
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
                     "total_tokens": 0,
                 },
                 "thread_id": thread_id,
-            }
-            return JSONResponse(content=response_obj)
+            })
 
 if __name__ == "__main__":
     import uvicorn
