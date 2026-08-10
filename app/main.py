@@ -305,7 +305,36 @@ async def chat_completions(
                 },
                 "thread_id": thread_id,
             })
-
+@app.get("/debug/token")
+async def debug_token():
+    """تست توکن - فقط برای دیباگ"""
+    headers = get_github_headers()
+    # مخفی کردن بخشی از توکن برای امنیت
+    token = headers["Authorization"]
+    masked_token = token[:20] + "..." + token[-10:] if len(token) > 30 else token[:10] + "..."
+    
+    # تست ارتباط با GitHub
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.post(
+                f"{GITHUB_API_BASE}/threads",
+                headers=headers,
+                json={}
+            )
+            return {
+                "status": resp.status_code,
+                "token_preview": masked_token,
+                "token_length": len(token),
+                "has_github_bearer": token.startswith("GitHub-Bearer "),
+                "response": resp.text[:500] if resp.status_code != 200 else "Success! Thread created.",
+                "thread_id": resp.json().get("id") if resp.status_code == 200 else None
+            }
+        except Exception as e:
+            return {
+                "error": str(e),
+                "token_preview": masked_token,
+                "token_length": len(token)
+            }
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
