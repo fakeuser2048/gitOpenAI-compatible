@@ -1,14 +1,14 @@
 import os
 import uuid
 import json
-import asyncio
-from typing import Optional, List, Dict, Any, AsyncGenerator
+import time
+from typing import Optional, List, Dict, Any
 from threading import Lock
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Header, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,24 +16,17 @@ load_dotenv()
 app = FastAPI(title="GitHub Copilot OpenAI-compatible API")
 
 # ---------- Config ----------
-GITHUB_TOKEN = os.getenv("GITHUB_COPILOT_TOKEN")
+GITHUB_TOKEN = os.getenv("GITHUB_COPILOT_TOKEN", "")
 if not GITHUB_TOKEN:
-    raise RuntimeError("GITHUB_COPILOT_TOKEN environment variable is required")
+    print("⚠️ WARNING: GITHUB_COPILOT_TOKEN is not set!")
 
 SERVER_API_KEY = os.getenv("SERVER_API_KEY", "")
 
 GITHUB_API_BASE = "https://api.individual.githubcopilot.com/github/chat"
 
 SUPPORTED_MODELS = [
-    "auto",
-    "github-copilot",
-    "claude-3.5-sonnet",
-    "claude-3.7-sonnet",
-    "gpt-4o",
-    "gpt-4.1",
-    "o3-mini",
-    "o4-mini",
-    "gemini-2.5-flash"
+    "auto", "github-copilot", "claude-3.5-sonnet", "claude-3.7-sonnet",
+    "gpt-4o", "gpt-4.1", "o3-mini", "o4-mini", "gemini-2.5-flash"
 ]
 
 thread_state: Dict[str, str] = {}
@@ -57,7 +50,6 @@ class ChatCompletionRequest(BaseModel):
 # ---------- Helpers ----------
 def get_github_headers() -> Dict[str, str]:
     token = GITHUB_TOKEN.strip()
-    # اگر توکن با GitHub-Bearer شروع نشده، اضافه کن
     if not token.startswith("GitHub-Bearer "):
         token = f"GitHub-Bearer {token}"
     return {
@@ -76,8 +68,7 @@ async def create_thread(client: httpx.AsyncClient) -> str:
             status_code=resp.status_code,
             detail=f"Failed to create thread: {resp.text}"
         )
-    data = resp.json()
-    return data["id"]
+    return resp.json()["id"]
 
 async def send_message_stream(
     client: httpx.AsyncClient,
@@ -110,7 +101,7 @@ async def send_message_stream(
     req = client.build_request("POST", url, headers=headers, json=body)
     return await client.send(req, stream=True)
 
-# ---------- Authentication ----------
+# ---------- Auth (ساده‌شده برای debug) ----------
 async def verify_api_key(authorization: Optional[str] = Header(None)):
     if SERVER_API_KEY:
         if not authorization or not authorization.startswith("Bearer "):
@@ -120,25 +111,12 @@ async def verify_api_key(authorization: Optional[str] = Header(None)):
             raise HTTPException(status_code=401, detail="Invalid API key")
     return True
 
-# ---------- OpenAI response formatters ----------
-def openai_chunk(
-    id: str,
-    model: str,
-    delta: Dict[str, Any],
-    finish_reason: Optional[str] = None,
-) -> bytes:
+# ---------- OpenAI formatters ----------
+def openai_chunk(id: str, model: str, delta: dict, finish_reason: str = None) -> bytes:
     chunk = {
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": int(__import__("time").time()),
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "delta": delta,
-                "finish_reason": finish_reason,
-            }
-        ],
+        "id": id, "object": "chat.completion.chunk",
+        "created": int(time.time()), "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
     return f"data: {json.dumps(chunk)}\n\n".encode()
 
@@ -150,27 +128,55 @@ def openai_final_chunk() -> bytes:
 async def root():
     return {
         "service": "GitHub Copilot OpenAI-compatible API",
-        "version": "1.0.0",
-        "endpoints": {
-            "models": "/v1/models",
-            "chat": "/v1/chat/completions"
-        }
+        "token_set": bool(GITHUB_TOKEN),
+        "token_length": len(GITHUB_TOKEN),
     }
+
+@app.get("/debug/token")
+async def debug_token():
+    """تست توکن - احراز هویت نمی‌خواهد"""
+    if not GITHUB_TOKEN:
+        return {"error": "GITHUB_COPILOT_TOKEN is empty or not set"}
+    
+    headers = get_github_headers()
+    token = headers["Authorization"]
+    masked = token[:25] + "..." + token[-15:] if len(token) > 40 else "too short"
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.post(
+                f"{GITHUB_API_BASE}/threads",
+                headers=headers,
+                json={}
+            )
+            return {
+                "status_code": resp.status_code,
+                "token_preview": masked,
+                "token_length": len(token),
+                "starts_with_bearer": token.startswith("GitHub-Bearer "),
+                "github_response": resp.text[:1000],
+                "success": resp.status_code == 200,
+            }
+        except Exception as e:
+            return {
+                "error": str(e),
+                "token_preview": masked,
+                "token_length": len(token),
+            }
 
 @app.get("/v1/models")
 async def list_models():
-    models_data = [
-        {"id": "github-copilot", "object": "model", "created": 1686935002, "owned_by": "github"},
-        {"id": "auto", "object": "model", "created": 1686935002, "owned_by": "github"},
-        {"id": "claude-3.5-sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
-        {"id": "claude-3.7-sonnet", "object": "model", "created": 1715000000, "owned_by": "anthropic"},
-        {"id": "gpt-4o", "object": "model", "created": 1713000000, "owned_by": "openai"},
-        {"id": "gpt-4.1", "object": "model", "created": 1717000000, "owned_by": "openai"},
-        {"id": "o3-mini", "object": "model", "created": 1718000000, "owned_by": "openai"},
-        {"id": "o4-mini", "object": "model", "created": 1720000000, "owned_by": "openai"},
-        {"id": "gemini-2.5-flash", "object": "model", "created": 1719000000, "owned_by": "google"},
-    ]
-    return {"object": "list", "data": models_data}
+    return {
+        "object": "list",
+        "data": [
+            {"id": "auto", "object": "model", "created": 1686935002, "owned_by": "github"},
+            {"id": "claude-3.5-sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+            {"id": "claude-3.7-sonnet", "object": "model", "created": 1715000000, "owned_by": "anthropic"},
+            {"id": "gpt-4o", "object": "model", "created": 1713000000, "owned_by": "openai"},
+            {"id": "o3-mini", "object": "model", "created": 1718000000, "owned_by": "openai"},
+            {"id": "gemini-2.5-flash", "object": "model", "created": 1719000000, "owned_by": "google"},
+        ]
+    }
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
@@ -178,14 +184,9 @@ async def chat_completions(
     body: ChatCompletionRequest,
     _: bool = Depends(verify_api_key),
 ):
-    # Validate model
     if body.model not in SUPPORTED_MODELS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Model '{body.model}' not supported. Available: {', '.join(SUPPORTED_MODELS)}"
-        )
+        raise HTTPException(status_code=400, detail=f"Model '{body.model}' not supported")
 
-    # Extract last user message
     user_messages = [m for m in body.messages if m.role == "user"]
     if not user_messages:
         raise HTTPException(status_code=400, detail="At least one user message required")
@@ -207,18 +208,12 @@ async def chat_completions(
         response_message_id = str(uuid.uuid4())
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
 
-        try:
-            resp = await send_message_stream(
-                client, thread_id, last_user_content, parent_id, response_message_id,
-                model=body.model
-            )
-            if resp.status_code != 200:
-                raise HTTPException(
-                    status_code=resp.status_code,
-                    detail=f"GitHub API error: {resp.text}"
-                )
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"GitHub API request failed: {str(e)}")
+        resp = await send_message_stream(
+            client, thread_id, last_user_content, parent_id, response_message_id,
+            model=body.model
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=f"GitHub API error: {resp.text}")
 
         if body.stream:
             async def event_stream():
@@ -249,8 +244,7 @@ async def chat_completions(
                         delta_content = data.get("body", "")
 
                     if delta_content is not None:
-                        delta = {"content": delta_content}
-                        yield openai_chunk(completion_id, body.model, delta, finish_reason)
+                        yield openai_chunk(completion_id, body.model, {"content": delta_content}, finish_reason)
 
                 if collected_assistant_id:
                     with state_lock:
@@ -287,54 +281,20 @@ async def chat_completions(
                 with state_lock:
                     thread_state[thread_id] = collected_assistant_id
 
-            final_text = "".join(full_content)
             return JSONResponse(content={
                 "id": completion_id,
                 "object": "chat.completion",
-                "created": int(__import__("time").time()),
+                "created": int(time.time()),
                 "model": body.model,
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": final_text},
+                    "message": {"role": "assistant", "content": "".join(full_content)},
                     "finish_reason": "stop",
                 }],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                },
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                 "thread_id": thread_id,
             })
-@app.get("/debug/token")
-async def debug_token():
-    """تست توکن - فقط برای دیباگ"""
-    headers = get_github_headers()
-    # مخفی کردن بخشی از توکن برای امنیت
-    token = headers["Authorization"]
-    masked_token = token[:20] + "..." + token[-10:] if len(token) > 30 else token[:10] + "..."
-    
-    # تست ارتباط با GitHub
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            resp = await client.post(
-                f"{GITHUB_API_BASE}/threads",
-                headers=headers,
-                json={}
-            )
-            return {
-                "status": resp.status_code,
-                "token_preview": masked_token,
-                "token_length": len(token),
-                "has_github_bearer": token.startswith("GitHub-Bearer "),
-                "response": resp.text[:500] if resp.status_code != 200 else "Success! Thread created.",
-                "thread_id": resp.json().get("id") if resp.status_code == 200 else None
-            }
-        except Exception as e:
-            return {
-                "error": str(e),
-                "token_preview": masked_token,
-                "token_length": len(token)
-            }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
