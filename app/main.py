@@ -1,407 +1,315 @@
+# app/main.py
 import os
+import uuid
 import json
 import time
-import uuid
-from typing import Any, AsyncGenerator
+import asyncio
+from typing import Optional, List, Dict, Any
+from threading import Lock
+from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request, Header, Depends
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
+from dotenv import load_dotenv
+from app.github_auth import GitHubTokenManager
 
+load_dotenv()
 
-app = FastAPI(
-    title="OpenAI Compatible Proxy",
-    version="1.0.0"
-)
+token_manager = GitHubTokenManager()
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    refresh_task = asyncio.create_task(token_manager.start_auto_refresh())
+    yield
+    refresh_task.cancel()
 
-UPSTREAM_URL = os.getenv("UPSTREAM_URL", "").rstrip("/")
-UPSTREAM_API_KEY = os.getenv("UPSTREAM_API_KEY", "")
-PROXY_API_KEY = os.getenv("PROXY_API_KEY", "")
+app = FastAPI(title="GitHub Copilot OpenAI-compatible API", lifespan=lifespan)
 
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "auto")
+SERVER_API_KEY = os.getenv("SERVER_API_KEY", "")
+ADMIN_KEY = os.getenv("ADMIN_KEY", os.getenv("SERVER_API_KEY", ""))
+GITHUB_API_BASE = "https://api.individual.githubcopilot.com/github/chat"
 
-REQUEST_TIMEOUT = float(
-    os.getenv("REQUEST_TIMEOUT", "300")
-)
+SUPPORTED_MODELS = [
+    "auto", "github-copilot", "claude-3.5-sonnet", "claude-3.7-sonnet",
+    "gpt-4o", "gpt-4.1", "o3-mini", "o4-mini", "gemini-2.5-flash"
+]
 
+thread_state: Dict[str, str] = {}
+state_lock = Lock()
 
 class Message(BaseModel):
     role: str
-    content: Any
-
+    content: str
 
 class ChatCompletionRequest(BaseModel):
-    model: str = DEFAULT_MODEL
-    messages: list[Message]
+    model: str = "auto"
+    messages: List[Message]
     stream: bool = False
-    temperature: float | None = None
-    max_tokens: int | None = None
-    top_p: float | None = None
+    temperature: Optional[float] = 1.0
+    top_p: Optional[float] = 1.0
+    n: Optional[int] = 1
+    max_tokens: Optional[int] = None
+    thread_id: Optional[str] = None
 
-
-def check_auth(authorization: str | None):
-    if not PROXY_API_KEY:
-        return
-
-    if not authorization:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing Authorization header"
-        )
-
-    expected = f"Bearer {PROXY_API_KEY}"
-
-    if authorization != expected:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid API key"
-        )
-
-
-def upstream_headers():
-    headers = {
+async def get_github_headers() -> Dict[str, str]:
+    token = await token_manager.get_valid_token()
+    if not token:
+        raise HTTPException(status_code=500, detail="No valid GitHub token available")
+    
+    if not token.startswith("GitHub-Bearer "):
+        token = f"GitHub-Bearer {token}"
+    
+    return {
+        "Authorization": token,
+        "copilot-integration-id": "copilot-chat",
+        "x-github-api-version": "2025-05-01",
         "Content-Type": "application/json",
-        "Accept": "application/json",
     }
 
-    if UPSTREAM_API_KEY:
-        headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
+async def create_thread(client: httpx.AsyncClient) -> str:
+    url = f"{GITHUB_API_BASE}/threads"
+    headers = await get_github_headers()
+    resp = await client.post(url, headers=headers, json={})
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"Failed to create thread: {resp.text}"
+        )
+    return resp.json()["id"]
 
-    return headers
+async def send_message_stream(
+    client: httpx.AsyncClient,
+    thread_id: str,
+    content: str,
+    parent_message_id: str,
+    response_message_id: str,
+    model: str = "auto",
+) -> httpx.Response:
+    url = f"{GITHUB_API_BASE}/threads/{thread_id}/messages"
+    headers = await get_github_headers()
+    headers["Content-Type"] = "text/event-stream"
+    body = {
+        "responseMessageID": response_message_id,
+        "content": content,
+        "intent": "conversation",
+        "references": [],
+        "context": [],
+        "currentURL": "https://github.com/copilot",
+        "streaming": True,
+        "confirmations": [],
+        "customInstructions": [],
+        "model": model,
+        "mode": "immersive",
+        "parentMessageID": parent_message_id,
+        "mediaContent": [],
+        "skillOptions": {"deepCodeSearch": False},
+        "requestTrace": False,
+    }
+    req = client.build_request("POST", url, headers=headers, json=body)
+    return await client.send(req, stream=True)
 
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if SERVER_API_KEY:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Missing or invalid API key")
+        if authorization.split(" ", 1)[1] != SERVER_API_KEY:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+    return True
 
-def convert_messages(messages: list[Message]):
-    return [
-        {
-            "role": message.role,
-            "content": message.content
-        }
-        for message in messages
-    ]
+def openai_chunk(id: str, model: str, delta: dict, finish_reason: str = None) -> bytes:
+    chunk = {
+        "id": id, "object": "chat.completion.chunk",
+        "created": int(time.time()), "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+    return f"data: {json.dumps(chunk)}\n\n".encode()
 
+def openai_final_chunk() -> bytes:
+    return b"data: [DONE]\n\n"
 
 @app.get("/")
 async def root():
     return {
-        "name": "OpenAI Compatible Proxy",
-        "status": "running",
-        "version": "1.0.0"
+        "service": "GitHub Copilot OpenAI-compatible API",
+        "auto_refresh": True,
+        "docs": "/docs",
     }
 
-
-@app.get("/health")
-async def health():
+@app.get("/debug/token")
+async def debug_token():
+    token = await token_manager.get_valid_token()
+    if not token:
+        return {"error": "No token available"}
+    
+    masked = token[:25] + "..." + token[-15:] if len(token) > 40 else "too short"
+    is_valid = await token_manager._validate_token(token)
+    
     return {
-        "status": "ok",
-        "upstream_configured": bool(UPSTREAM_URL)
+        "token_preview": masked,
+        "is_valid": is_valid,
+        "expires_at": str(token_manager.expires_at) if token_manager.expires_at else None,
+        "has_session_cookie": bool(token_manager.github_session),
     }
 
+@app.get("/admin/token-status")
+async def token_status():
+    token = await token_manager.get_valid_token()
+    if not token:
+        return {"status": "no_token", "is_valid": False}
+    
+    is_valid = await token_manager._validate_token(token)
+    return {
+        "is_valid": is_valid,
+        "status": "valid" if is_valid else "invalid",
+        "expires_at": str(token_manager.expires_at) if token_manager.expires_at else None,
+        "auto_refresh": True,
+    }
+
+@app.post("/admin/refresh-token")
+async def force_refresh_token(
+    admin_key: str = Header(..., alias="X-Admin-Key")
+):
+    if ADMIN_KEY and admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    
+    from datetime import datetime, timedelta
+    new_token = await token_manager._fetch_new_token()
+    if new_token:
+        token_manager.token = new_token
+        token_manager.expires_at = datetime.now() + timedelta(seconds=token_manager.refresh_interval)
+        return {"status": "refreshed", "token_valid": True}
+    
+    return {"status": "failed", "token_valid": False}
 
 @app.get("/v1/models")
-async def models(
-    authorization: str | None = Header(default=None)
-):
-    check_auth(authorization)
-
-    model = DEFAULT_MODEL
-
+async def list_models():
     return {
         "object": "list",
         "data": [
-            {
-                "id": model,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "upstream"
-            }
+            {"id": "auto", "object": "model", "created": 1686935002, "owned_by": "github"},
+            {"id": "claude-3.5-sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+            {"id": "gpt-4o", "object": "model", "created": 1713000000, "owned_by": "openai"},
+            {"id": "o3-mini", "object": "model", "created": 1718000000, "owned_by": "openai"},
         ]
     }
 
-
-async def normal_request(
-    request: ChatCompletionRequest
-):
-    if not UPSTREAM_URL:
-        raise HTTPException(
-            status_code=500,
-            detail="UPSTREAM_URL is not configured"
-        )
-
-    payload = {
-        "model": request.model,
-        "messages": convert_messages(request.messages),
-        "stream": False
-    }
-
-    if request.temperature is not None:
-        payload["temperature"] = request.temperature
-
-    if request.max_tokens is not None:
-        payload["max_tokens"] = request.max_tokens
-
-    if request.top_p is not None:
-        payload["top_p"] = request.top_p
-
-    timeout = httpx.Timeout(
-        REQUEST_TIMEOUT,
-        connect=30
-    )
-
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            UPSTREAM_URL,
-            headers=upstream_headers(),
-            json=payload
-        )
-
-    if response.status_code >= 400:
-        return JSONResponse(
-            status_code=response.status_code,
-            content={
-                "error": {
-                    "message": response.text,
-                    "type": "upstream_error"
-                }
-            }
-        )
-
-    try:
-        data = response.json()
-    except Exception:
-        data = {
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": request.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": response.text
-                    },
-                    "finish_reason": "stop"
-                }
-            ]
-        }
-
-    return JSONResponse(content=data)
-
-
-async def stream_request(
-    request: ChatCompletionRequest
-) -> AsyncGenerator[str, None]:
-
-    if not UPSTREAM_URL:
-        error = {
-            "error": {
-                "message": "UPSTREAM_URL is not configured",
-                "type": "configuration_error"
-            }
-        }
-
-        yield f"data: {json.dumps(error)}\n\n"
-        yield "data: [DONE]\n\n"
-        return
-
-    payload = {
-        "model": request.model,
-        "messages": convert_messages(request.messages),
-        "stream": True
-    }
-
-    if request.temperature is not None:
-        payload["temperature"] = request.temperature
-
-    if request.max_tokens is not None:
-        payload["max_tokens"] = request.max_tokens
-
-    if request.top_p is not None:
-        payload["top_p"] = request.top_p
-
-    timeout = httpx.Timeout(
-        REQUEST_TIMEOUT,
-        connect=30
-    )
-
-    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
-
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-
-            async with client.stream(
-                "POST",
-                UPSTREAM_URL,
-                headers=upstream_headers(),
-                json=payload
-            ) as response:
-
-                if response.status_code >= 400:
-
-                    body = await response.aread()
-
-                    error = {
-                        "error": {
-                            "message": body.decode(
-                                "utf-8",
-                                errors="replace"
-                            ),
-                            "type": "upstream_error"
-                        }
-                    }
-
-                    yield (
-                        "data: "
-                        + json.dumps(error, ensure_ascii=False)
-                        + "\n\n"
-                    )
-
-                    yield "data: [DONE]\n\n"
-                    return
-
-                async for line in response.aiter_lines():
-
-                    if not line:
-                        continue
-
-                    # Upstream already uses SSE
-                    if line.startswith("data:"):
-                        raw = line[5:].strip()
-
-                        if raw == "[DONE]":
-                            yield "data: [DONE]\n\n"
-                            return
-
-                        try:
-                            parsed = json.loads(raw)
-
-                            # If already OpenAI-compatible,
-                            # forward it directly.
-                            if (
-                                isinstance(parsed, dict)
-                                and (
-                                    "choices" in parsed
-                                    or "error" in parsed
-                                )
-                            ):
-                                yield (
-                                    "data: "
-                                    + json.dumps(
-                                        parsed,
-                                        ensure_ascii=False
-                                    )
-                                    + "\n\n"
-                                )
-                                continue
-
-                        except Exception:
-                            pass
-
-                        # Generic upstream data
-                        chunk = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": request.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "content": raw
-                                    },
-                                    "finish_reason": None
-                                }
-                            ]
-                        }
-
-                        yield (
-                            "data: "
-                            + json.dumps(
-                                chunk,
-                                ensure_ascii=False
-                            )
-                            + "\n\n"
-                        )
-
-                    else:
-                        # Non-SSE upstream
-                        chunk = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": request.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "content": line
-                                    },
-                                    "finish_reason": None
-                                }
-                            ]
-                        }
-
-                        yield (
-                            "data: "
-                            + json.dumps(
-                                chunk,
-                                ensure_ascii=False
-                            )
-                            + "\n\n"
-                        )
-
-    except httpx.TimeoutException:
-
-        error = {
-            "error": {
-                "message": "Upstream request timed out",
-                "type": "timeout_error"
-            }
-        }
-
-        yield (
-            "data: "
-            + json.dumps(error)
-            + "\n\n"
-        )
-
-    except Exception as exc:
-
-        error = {
-            "error": {
-                "message": str(exc),
-                "type": "proxy_error"
-            }
-        }
-
-        yield (
-            "data: "
-            + json.dumps(error)
-            + "\n\n"
-        )
-
-    yield "data: [DONE]\n\n"
-
-
 @app.post("/v1/chat/completions")
 async def chat_completions(
-    request: ChatCompletionRequest,
-    authorization: str | None = Header(default=None)
+    request: Request,
+    body: ChatCompletionRequest,
+    _: bool = Depends(verify_api_key),
 ):
+    if body.model not in SUPPORTED_MODELS:
+        raise HTTPException(status_code=400, detail=f"Model '{body.model}' not supported")
 
-    check_auth(authorization)
+    user_messages = [m for m in body.messages if m.role == "user"]
+    if not user_messages:
+        raise HTTPException(status_code=400, detail="At least one user message required")
+    last_user_content = user_messages[-1].content
 
-    if request.stream:
-        return StreamingResponse(
-            stream_request(request),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"
-            }
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        thread_id = body.thread_id
+        parent_id = "root"
+        with state_lock:
+            if thread_id and thread_id in thread_state:
+                parent_id = thread_state[thread_id]
+
+        if not thread_id or thread_id not in thread_state:
+            thread_id = await create_thread(client)
+            with state_lock:
+                thread_state[thread_id] = "root"
+            parent_id = "root"
+
+        response_message_id = str(uuid.uuid4())
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+
+        resp = await send_message_stream(
+            client, thread_id, last_user_content, parent_id, response_message_id,
+            model=body.model
         )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=f"GitHub API error: {resp.text}")
 
-    return await normal_request(request)
+        if body.stream:
+            async def event_stream():
+                collected_assistant_id = None
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    delta_content = None
+                    finish_reason = None
+                    if "choices" in data and len(data["choices"]) > 0:
+                        choice = data["choices"][0]
+                        if "delta" in choice:
+                            delta_content = choice["delta"].get("content", "")
+                            finish_reason = choice.get("finish_reason")
+                        if "message" in choice and "id" in choice["message"]:
+                            collected_assistant_id = choice["message"]["id"]
+                    elif "body" in data:
+                        delta_content = data["body"]
+
+                    if delta_content is not None:
+                        yield openai_chunk(completion_id, body.model, {"content": delta_content}, finish_reason)
+
+                if collected_assistant_id:
+                    with state_lock:
+                        thread_state[thread_id] = collected_assistant_id
+                yield openai_final_chunk()
+
+            return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+        else:
+            full_content = []
+            collected_assistant_id = None
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if "choices" in data and len(data["choices"]) > 0:
+                    choice = data["choices"][0]
+                    if "delta" in choice:
+                        content = choice["delta"].get("content", "")
+                        if content:
+                            full_content.append(content)
+                    if "message" in choice and "id" in choice["message"]:
+                        collected_assistant_id = choice["message"]["id"]
+                elif "body" in data:
+                    full_content.append(data["body"])
+
+            if collected_assistant_id:
+                with state_lock:
+                    thread_state[thread_id] = collected_assistant_id
+
+            return JSONResponse(content={
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": body.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "".join(full_content)},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "thread_id": thread_id,
+            })
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
