@@ -20,9 +20,22 @@ GITHUB_TOKEN = os.getenv("GITHUB_COPILOT_TOKEN")
 if not GITHUB_TOKEN:
     raise RuntimeError("GITHUB_COPILOT_TOKEN environment variable is required")
 
-SERVER_API_KEY = os.getenv("SERVER_API_KEY", "")  # if empty, no client auth needed
+SERVER_API_KEY = os.getenv("SERVER_API_KEY", "")
 
 GITHUB_API_BASE = "https://api.individual.githubcopilot.com/github/chat"
+
+# Supported models
+SUPPORTED_MODELS = [
+    "auto",
+    "github-copilot",
+    "claude-3.5-sonnet",
+    "claude-3.7-sonnet",
+    "gpt-4o",
+    "gpt-4.1",
+    "o3-mini",
+    "o4-mini",
+    "gemini-2.5-flash"
+]
 
 # Thread state: thread_id -> last_assistant_message_id
 thread_state: Dict[str, str] = {}
@@ -34,14 +47,13 @@ class Message(BaseModel):
     content: str
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "github-copilot"
+    model: str = "auto"
     messages: List[Message]
     stream: bool = False
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
     max_tokens: Optional[int] = None
-    # Custom field for thread management
     thread_id: Optional[str] = None
 
 # ---------- Helpers ----------
@@ -56,12 +68,10 @@ def get_github_headers() -> Dict[str, str]:
 async def create_thread(client: httpx.AsyncClient) -> str:
     url = f"{GITHUB_API_BASE}/threads"
     headers = get_github_headers()
-    # GitHub expects empty body {}
     resp = await client.post(url, headers=headers, json={})
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"Failed to create thread: {resp.text}")
     data = resp.json()
-    # The response is like {"id": "thread-uuid"}
     return data["id"]
 
 async def send_message_stream(
@@ -70,10 +80,11 @@ async def send_message_stream(
     content: str,
     parent_message_id: str,
     response_message_id: str,
+    model: str = "auto",
 ) -> httpx.Response:
     url = f"{GITHUB_API_BASE}/threads/{thread_id}/messages"
     headers = get_github_headers()
-    headers["Content-Type"] = "text/event-stream"  # request for SSE
+    headers["Content-Type"] = "text/event-stream"
     body = {
         "responseMessageID": response_message_id,
         "content": content,
@@ -84,7 +95,7 @@ async def send_message_stream(
         "streaming": True,
         "confirmations": [],
         "customInstructions": [],
-        "model": "auto",
+        "model": model,
         "mode": "immersive",
         "parentMessageID": parent_message_id,
         "mediaContent": [],
@@ -94,7 +105,7 @@ async def send_message_stream(
     req = client.build_request("POST", url, headers=headers, json=body)
     return await client.send(req, stream=True)
 
-# ---------- Authentication dependency ----------
+# ---------- Authentication ----------
 async def verify_api_key(authorization: Optional[str] = Header(None)):
     if SERVER_API_KEY:
         if not authorization or not authorization.startswith("Bearer "):
@@ -102,7 +113,6 @@ async def verify_api_key(authorization: Optional[str] = Header(None)):
         token = authorization.split(" ", 1)[1]
         if token != SERVER_API_KEY:
             raise HTTPException(status_code=401, detail="Invalid API key")
-    # If no SERVER_API_KEY set, allow all requests
     return True
 
 # ---------- OpenAI response formatters ----------
@@ -133,16 +143,20 @@ def openai_final_chunk() -> bytes:
 # ---------- Routes ----------
 @app.get("/v1/models")
 async def list_models():
+    models_data = [
+        {"id": "github-copilot", "object": "model", "created": 1686935002, "owned_by": "github"},
+        {"id": "auto", "object": "model", "created": 1686935002, "owned_by": "github"},
+        {"id": "claude-3.5-sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+        {"id": "claude-3.7-sonnet", "object": "model", "created": 1715000000, "owned_by": "anthropic"},
+        {"id": "gpt-4o", "object": "model", "created": 1713000000, "owned_by": "openai"},
+        {"id": "gpt-4.1", "object": "model", "created": 1717000000, "owned_by": "openai"},
+        {"id": "o3-mini", "object": "model", "created": 1718000000, "owned_by": "openai"},
+        {"id": "o4-mini", "object": "model", "created": 1720000000, "owned_by": "openai"},
+        {"id": "gemini-2.5-flash", "object": "model", "created": 1719000000, "owned_by": "google"},
+    ]
     return {
         "object": "list",
-        "data": [
-            {
-                "id": "github-copilot",
-                "object": "model",
-                "created": 1686935002,
-                "owned_by": "github",
-            }
-        ],
+        "data": models_data
     }
 
 @app.post("/v1/chat/completions")
@@ -151,7 +165,14 @@ async def chat_completions(
     body: ChatCompletionRequest,
     _: bool = Depends(verify_api_key),
 ):
-    # Extract last user message (assuming it's the new prompt)
+    # Validate model
+    if body.model not in SUPPORTED_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{body.model}' not supported. Available models: {', '.join(SUPPORTED_MODELS)}"
+        )
+
+    # Extract last user message
     user_messages = [m for m in body.messages if m.role == "user"]
     if not user_messages:
         raise HTTPException(status_code=400, detail="At least one user message required")
@@ -164,23 +185,21 @@ async def chat_completions(
         with state_lock:
             if thread_id and thread_id in thread_state:
                 parent_id = thread_state[thread_id]
-            # else: new thread, parent stays root, will be created below
 
         if not thread_id or thread_id not in thread_state:
-            # Create new thread
             thread_id = await create_thread(client)
             with state_lock:
-                thread_state[thread_id] = "root"  # initial parent
+                thread_state[thread_id] = "root"
             parent_id = "root"
 
         # Generate unique IDs
         response_message_id = str(uuid.uuid4())
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
 
-        # Send message to GitHub API and stream
         try:
             resp = await send_message_stream(
-                client, thread_id, last_user_content, parent_id, response_message_id
+                client, thread_id, last_user_content, parent_id, response_message_id,
+                model=body.model  # Pass selected model
             )
             if resp.status_code != 200:
                 raise HTTPException(status_code=resp.status_code, detail=f"GitHub API error: {resp.text}")
@@ -201,20 +220,16 @@ async def chat_completions(
                     except json.JSONDecodeError:
                         continue
 
-                    # Try to extract delta content
                     delta_content = None
                     finish_reason = None
-                    # GitHub Copilot may wrap in choices format
                     if "choices" in data and len(data["choices"]) > 0:
                         choice = data["choices"][0]
                         if "delta" in choice:
                             delta_content = choice["delta"].get("content", "")
                             finish_reason = choice.get("finish_reason")
-                        # Update assistant message id if available (usually in message metadata)
                         if "message" in choice and "id" in choice["message"]:
                             collected_assistant_id = choice["message"]["id"]
                     elif "body" in data:
-                        # Alternate format: simple body text
                         delta_content = data["body"]
                     elif data.get("type") == "content":
                         delta_content = data.get("body", "")
@@ -223,7 +238,6 @@ async def chat_completions(
                         delta = {"content": delta_content}
                         yield openai_chunk(completion_id, body.model, delta, finish_reason)
 
-                # After stream ends, store the assistant message id for next turn
                 if collected_assistant_id:
                     with state_lock:
                         thread_state[thread_id] = collected_assistant_id
@@ -232,7 +246,7 @@ async def chat_completions(
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
         else:
-            # Non-streaming: collect full content
+            # Non-streaming
             full_content = []
             collected_assistant_id = None
             async for line in resp.aiter_lines():
@@ -281,7 +295,7 @@ async def chat_completions(
                     "completion_tokens": 0,
                     "total_tokens": 0,
                 },
-                "thread_id": thread_id,  # custom field for session continuity
+                "thread_id": thread_id,
             }
             return JSONResponse(content=response_obj)
 
