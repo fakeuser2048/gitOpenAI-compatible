@@ -1,8 +1,11 @@
-# railway.toml
 [build]
 builder = "DOCKERFILE"
-dockerfilePath = "./Dockerfile"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-numReplicas = 1
-startCommand = ""
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+[env]
+CLOUDFLARE_ACCOUNT_ID = "751283466308cea5585a76eeafeb0f54"
+CLOUDFLARE_API_TOKEN = "cfut_h6Nq5Mwo2yow9uVBa6PibTr5o6jzvLlTfXQrqBpxed45a0ce"
