@@ -24,17 +24,87 @@ HEADERS = {
 
 # ==================== Available Models (Verified Working) ====================
 AVAILABLE_MODELS = [
+    # ===== Text Generation =====
     "@cf/meta/llama-3.2-1b-instruct",
     "@cf/meta/llama-3.2-3b-instruct",
-    "@cf/meta/llama-3.1-8b-instruct-awq",
-    "@cf/meta/llama-3-8b-instruct",
-    "@cf/meta/llama-3-8b-instruct-awq",
-    "@cf/meta/llama-2-7b-chat-fp16",
+    "@cf/meta/llama-3.2-11b-vision-instruct",
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "@cf/meta/llama-3.1-8b-instruct-fast",
+    "@cf/meta/llama-3.1-8b-instruct-fp8",
     "@cf/meta/llama-4-scout-17b-16e-instruct",
-    "@cf/google/gemma-3-12b-it",
+    "@cf/meta/llama-guard-3-8b",
+    "@cf/meta-llama/llama-2-7b-chat-hf-lora",
+    "@cf/google/gemma-4-26b-a4b-it",
+    "@cf/google/gemma-2b-it-lora",
+    "@cf/google/gemma-7b-it-lora",
+    "@cf/aisingapore/gemma-sea-lion-v4-27b-it",
+    "@cf/zai-org/glm-4.7-flash",
+    "@cf/openai/gpt-oss-120b",
+    "@cf/openai/gpt-oss-20b",
+    "@cf/nvidia/nemotron-3-120b-a12b",
+    "@cf/qwen/qwen3-30b-a3b-fp8",
     "@cf/qwen/qwq-32b",
     "@cf/qwen/qwen2.5-coder-32b-instruct",
-    "@cf/qwen/qwen3-30b-a3b-fp8",
+    "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+    "@cf/mistralai/mistral-small-3.1-24b-instruct",
+    "@cf/mistral/mistral-7b-instruct-v0.2-lora",
+    "@cf/ibm-granite/granite-4.0-h-micro",
+
+    # ===== Text Embeddings =====
+    "@cf/baai/bge-base-en-v1.5",
+    "@cf/baai/bge-large-en-v1.5",
+    "@cf/baai/bge-small-en-v1.5",
+    "@cf/baai/bge-m3",
+    "@cf/google/embeddinggemma-300m",
+    "@cf/qwen/qwen3-embedding-0.6b",
+    "@cf/pfnet/plamo-embedding-1b",
+
+    # ===== Text Classification =====
+    "@cf/baai/bge-reranker-base",
+    "@cf/huggingface/distilbert-sst-2-int8",
+
+    # ===== Automatic Speech Recognition =====
+    "@cf/openai/whisper",
+    "@cf/openai/whisper-large-v3-turbo",
+    "@cf/openai/whisper-tiny-en",
+    "@cf/deepgram/flux",
+    "@cf/deepgram/nova-3",
+
+    # ===== Text-to-Speech =====
+    "@cf/myshell-ai/melotts",
+    "@cf/deepgram/aura-1",
+    "@cf/deepgram/aura-2-en",
+    "@cf/deepgram/aura-2-es",
+
+    # ===== Text-to-Image =====
+    "@cf/black-forest-labs/flux-1-schnell",
+    "@cf/black-forest-labs/flux-2-klein-9b",
+    "@cf/black-forest-labs/flux-2-klein-4b",
+    "@cf/black-forest-labs/flux-2-dev",
+    "@cf/lykon/dreamshaper-8-lcm",
+    "@cf/runwayml/stable-diffusion-v1-5-img2img",
+    "@cf/runwayml/stable-diffusion-v1-5-inpainting",
+    "@cf/stabilityai/stable-diffusion-xl-base-1.0",
+    "@cf/bytedance/stable-diffusion-xl-lightning",
+    "@cf/leonardo/phoenix-1.0",
+    "@cf/leonardo/lucid-origin",
+
+    # ===== Image-to-Text =====
+    "@cf/llava-hf/llava-1.5-7b-hf",
+    "@cf/moondream/moondream3.1-9B-A2B",
+
+    # ===== Image Classification =====
+    "@cf/microsoft/resnet-50",
+
+    # ===== Object Detection =====
+    "@cf/facebook/detr-resnet-50",
+
+    # ===== Translation =====
+    "@cf/meta/m2m100-1.2b",
+    "@cf/ai4bharat/indictrans2-en-indic-1B",
+
+    # ===== Voice Activity Detection =====
+    "@cf/pipecat-ai/smart-turn-v2",
 ]
 
 # ==================== OpenAI-Compatible Schemas ====================
