@@ -24,7 +24,6 @@ HEADERS = {
 
 # ==================== Available Models ====================
 AVAILABLE_MODELS = [
-    # Meta Llama
     "@cf/meta/llama-3.2-1b-instruct",
     "@cf/meta/llama-3.2-3b-instruct",
     "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
@@ -33,41 +32,97 @@ AVAILABLE_MODELS = [
     "@cf/meta/llama-4-scout-17b-16e-instruct",
     "@cf/meta/llama-guard-3-8b",
     "@cf/meta-llama/llama-2-7b-chat-hf-lora",
-    
-    # Google Gemma
     "@cf/google/gemma-4-26b-a4b-it",
     "@cf/google/gemma-2b-it-lora",
     "@cf/google/gemma-7b-it-lora",
     "@cf/aisingapore/gemma-sea-lion-v4-27b-it",
-    
-    # Qwen
     "@cf/qwen/qwen3-30b-a3b-fp8",
     "@cf/qwen/qwq-32b",
     "@cf/qwen/qwen2.5-coder-32b-instruct",
-    
-    # ZAI
     "@cf/zai-org/glm-4.7-flash",
-    
-    # OpenAI GPT-OSS
     "@cf/openai/gpt-oss-120b",
     "@cf/openai/gpt-oss-20b",
-    
-    # NVIDIA
     "@cf/nvidia/nemotron-3-120b-a12b",
-    
-    # DeepSeek
     "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
-    
-    # Mistral
     "@cf/mistralai/mistral-small-3.1-24b-instruct",
     "@cf/mistral/mistral-7b-instruct-v0.2-lora",
-    
-    # IBM Granite
     "@cf/ibm-granite/granite-4.0-h-micro",
-    
-    # Moondream
     "@cf/moondream/moondream3.1-9B-A2B",
 ]
+
+# ==================== Token Counter ====================
+def count_tokens(text: str) -> int:
+    """Simple token counter (approximate)"""
+    # هر ۴ کاراکتر ≈ ۱ توکن
+    return len(text) // 4
+
+def estimate_total_tokens(messages: List[Dict[str, str]], max_tokens: int) -> int:
+    """Estimate total tokens for a request"""
+    total = 0
+    for msg in messages:
+        total += count_tokens(msg.get("content", ""))
+    return total + max_tokens
+
+# ==================== Message Compressor ====================
+def compress_messages(messages: List[Dict[str, str]], max_context: int = 30000) -> List[Dict[str, str]]:
+    """
+    Compress messages to fit within context limit.
+    Preserves system message and recent messages, summarizes older ones.
+    """
+    if not messages:
+        return messages
+    
+    MAX_INPUT_TOKENS = max_context
+    MAX_RECENT_MESSAGES = 10  # تعداد پیام‌های اخیر که نگه داشته می‌شوند
+    
+    # محاسبه توکن‌های فعلی
+    current_tokens = 0
+    for msg in messages:
+        current_tokens += count_tokens(msg.get("content", ""))
+    
+    # اگر زیر محدودیت است، همان را برگردان
+    if current_tokens < MAX_INPUT_TOKENS:
+        return messages
+    
+    # جداسازی پیام سیستم (اگر وجود دارد)
+    system_msg = None
+    other_messages = []
+    
+    for msg in messages:
+        if msg.get("role") == "system":
+            system_msg = msg
+        else:
+            other_messages.append(msg)
+    
+    # پیام‌های اخیر را نگه دار
+    recent_messages = other_messages[-MAX_RECENT_MESSAGES:] if len(other_messages) > MAX_RECENT_MESSAGES else other_messages
+    
+    # پیام‌های قدیمی‌تر را خلاصه کن
+    older_messages = other_messages[:-MAX_RECENT_MESSAGES] if len(other_messages) > MAX_RECENT_MESSAGES else []
+    
+    compressed = []
+    
+    # سیستم پیام را اضافه کن
+    if system_msg:
+        compressed.append(system_msg)
+    
+    # خلاصه پیام‌های قدیمی
+    if older_messages:
+        summary_text = "خلاصه مکالمات قبلی:\n"
+        for msg in older_messages:
+            role = "کاربر" if msg.get("role") == "user" else "دستیار"
+            content = msg.get("content", "")[:200]
+            summary_text += f"{role}: {content}\n"
+        
+        compressed.append({
+            "role": "system",
+            "content": f"[خلاصه مکالمات قبلی]\n{summary_text}"
+        })
+    
+    # پیام‌های اخیر را اضافه کن
+    compressed.extend(recent_messages)
+    
+    return compressed
 
 # ==================== OpenAI-Compatible Schemas ====================
 
@@ -78,7 +133,6 @@ class Message(BaseModel):
     @field_validator('content', mode='before')
     @classmethod
     def normalize_content(cls, v):
-        """Normalize content to string"""
         if v is None:
             return ""
         if isinstance(v, str):
@@ -138,27 +192,36 @@ def get_timestamp() -> int:
     return int(time.time())
 
 def prepare_payload(request: ChatCompletionRequest) -> Dict[str, Any]:
-    """Prepare payload for Cloudflare API."""
+    """Prepare payload for Cloudflare API with automatic compression."""
     
-    messages = []
+    # Convert messages to dict format
+    raw_messages = []
     for msg in request.messages:
         content = msg.content if msg.content else ""
         if content and str(content).strip():
-            messages.append({
+            raw_messages.append({
                 "role": msg.role,
                 "content": str(content)
             })
     
-    if not messages:
+    if not raw_messages:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one non-empty message is required"
         )
     
-    payload = {"messages": messages}
+    # Compress messages if needed
+    MAX_CONTEXT = 30000  # 32768 - reserve for output
+    compressed_messages = compress_messages(raw_messages, MAX_CONTEXT)
     
+    payload = {"messages": compressed_messages}
+    
+    # محدود کردن max_tokens
     if request.max_tokens:
-        payload["max_tokens"] = min(request.max_tokens, 8192)
+        payload["max_tokens"] = min(request.max_tokens, 1024)
+    else:
+        payload["max_tokens"] = 512
+    
     if request.temperature is not None:
         payload["temperature"] = request.temperature
     if request.top_p is not None:
@@ -242,7 +305,7 @@ def format_response(
 
 app = FastAPI(
     title="Cloudflare AI API (OpenAI-Compatible)",
-    description="OpenAI-compatible API for Cloudflare AI models",
+    description="OpenAI-compatible API for Cloudflare AI models with automatic context compression",
     version="1.0.0"
 )
 
@@ -251,8 +314,13 @@ app = FastAPI(
 @app.get("/")
 async def root():
     return {
-        "message": "Cloudflare AI API (OpenAI-Compatible)",
+        "message": "Cloudflare AI API (OpenAI-Compatible) - با قابلیت فشرده‌سازی خودکار",
         "models": AVAILABLE_MODELS,
+        "features": {
+            "auto_compression": "فشرده‌سازی خودکار پیام‌های طولانی",
+            "context_limit": "32768 توکن",
+            "max_messages": "نامحدود (با خلاصه‌سازی)"
+        },
         "endpoints": {
             "/v1/models": "List available models",
             "/v1/chat/completions": "Chat completions endpoint"
@@ -276,7 +344,7 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    """OpenAI-compatible chat completions endpoint."""
+    """OpenAI-compatible chat completions endpoint with auto-compression."""
     
     if request.model not in AVAILABLE_MODELS:
         raise HTTPException(
