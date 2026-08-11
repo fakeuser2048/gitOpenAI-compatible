@@ -2,12 +2,12 @@ import os
 import json
 import time
 import uuid
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 
 import requests
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,102 +22,91 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# ==================== Available Models (Verified Working) ====================
+# ==================== Available Models ====================
 AVAILABLE_MODELS = [
-    # ===== Text Generation =====
+    # Meta Llama
     "@cf/meta/llama-3.2-1b-instruct",
     "@cf/meta/llama-3.2-3b-instruct",
-    "@cf/meta/llama-3.2-11b-vision-instruct",
     "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     "@cf/meta/llama-3.1-8b-instruct-fast",
     "@cf/meta/llama-3.1-8b-instruct-fp8",
     "@cf/meta/llama-4-scout-17b-16e-instruct",
     "@cf/meta/llama-guard-3-8b",
     "@cf/meta-llama/llama-2-7b-chat-hf-lora",
+    
+    # Google Gemma
     "@cf/google/gemma-4-26b-a4b-it",
     "@cf/google/gemma-2b-it-lora",
     "@cf/google/gemma-7b-it-lora",
     "@cf/aisingapore/gemma-sea-lion-v4-27b-it",
-    "@cf/zai-org/glm-4.7-flash",
-    "@cf/openai/gpt-oss-120b",
-    "@cf/openai/gpt-oss-20b",
-    "@cf/nvidia/nemotron-3-120b-a12b",
+    
+    # Qwen
     "@cf/qwen/qwen3-30b-a3b-fp8",
     "@cf/qwen/qwq-32b",
     "@cf/qwen/qwen2.5-coder-32b-instruct",
+    
+    # ZAI
+    "@cf/zai-org/glm-4.7-flash",
+    
+    # OpenAI GPT-OSS
+    "@cf/openai/gpt-oss-120b",
+    "@cf/openai/gpt-oss-20b",
+    
+    # NVIDIA
+    "@cf/nvidia/nemotron-3-120b-a12b",
+    
+    # DeepSeek
     "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+    
+    # Mistral
     "@cf/mistralai/mistral-small-3.1-24b-instruct",
     "@cf/mistral/mistral-7b-instruct-v0.2-lora",
+    
+    # IBM Granite
     "@cf/ibm-granite/granite-4.0-h-micro",
-
-    # ===== Text Embeddings =====
-    "@cf/baai/bge-base-en-v1.5",
-    "@cf/baai/bge-large-en-v1.5",
-    "@cf/baai/bge-small-en-v1.5",
-    "@cf/baai/bge-m3",
-    "@cf/google/embeddinggemma-300m",
-    "@cf/qwen/qwen3-embedding-0.6b",
-    "@cf/pfnet/plamo-embedding-1b",
-
-    # ===== Text Classification =====
-    "@cf/baai/bge-reranker-base",
-    "@cf/huggingface/distilbert-sst-2-int8",
-
-    # ===== Automatic Speech Recognition =====
-    "@cf/openai/whisper",
-    "@cf/openai/whisper-large-v3-turbo",
-    "@cf/openai/whisper-tiny-en",
-    "@cf/deepgram/flux",
-    "@cf/deepgram/nova-3",
-
-    # ===== Text-to-Speech =====
-    "@cf/myshell-ai/melotts",
-    "@cf/deepgram/aura-1",
-    "@cf/deepgram/aura-2-en",
-    "@cf/deepgram/aura-2-es",
-
-    # ===== Text-to-Image =====
-    "@cf/black-forest-labs/flux-1-schnell",
-    "@cf/black-forest-labs/flux-2-klein-9b",
-    "@cf/black-forest-labs/flux-2-klein-4b",
-    "@cf/black-forest-labs/flux-2-dev",
-    "@cf/lykon/dreamshaper-8-lcm",
-    "@cf/runwayml/stable-diffusion-v1-5-img2img",
-    "@cf/runwayml/stable-diffusion-v1-5-inpainting",
-    "@cf/stabilityai/stable-diffusion-xl-base-1.0",
-    "@cf/bytedance/stable-diffusion-xl-lightning",
-    "@cf/leonardo/phoenix-1.0",
-    "@cf/leonardo/lucid-origin",
-
-    # ===== Image-to-Text =====
-    "@cf/llava-hf/llava-1.5-7b-hf",
+    
+    # Moondream
     "@cf/moondream/moondream3.1-9B-A2B",
-
-    # ===== Image Classification =====
-    "@cf/microsoft/resnet-50",
-
-    # ===== Object Detection =====
-    "@cf/facebook/detr-resnet-50",
-
-    # ===== Translation =====
-    "@cf/meta/m2m100-1.2b",
-    "@cf/ai4bharat/indictrans2-en-indic-1B",
-
-    # ===== Voice Activity Detection =====
-    "@cf/pipecat-ai/smart-turn-v2",
 ]
 
 # ==================== OpenAI-Compatible Schemas ====================
 
 class Message(BaseModel):
     role: str
-    content: str
+    content: Optional[Union[str, Dict[str, Any], List[Dict[str, Any]]]] = None
+    
+    @field_validator('content', mode='before')
+    @classmethod
+    def normalize_content(cls, v):
+        """Normalize content to string"""
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        if isinstance(v, dict):
+            if v.get("type") == "text" and "text" in v:
+                return v["text"]
+            if "text" in v:
+                return v["text"]
+            return str(v)
+        if isinstance(v, list):
+            texts = []
+            for item in v:
+                if isinstance(item, dict):
+                    if item.get("type") == "text" and "text" in item:
+                        texts.append(item["text"])
+                    elif "text" in item:
+                        texts.append(item["text"])
+                elif isinstance(item, str):
+                    texts.append(item)
+            return "\n".join(texts) if texts else ""
+        return str(v) if v is not None else ""
 
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[Message]
     temperature: Optional[float] = Field(0.7, ge=0.0, le=2.0)
-    max_tokens: Optional[int] = Field(256, ge=1, le=2048)
+    max_tokens: Optional[int] = Field(256, ge=1, le=8192)
     top_p: Optional[float] = Field(1.0, ge=0.0, le=1.0)
     stream: Optional[bool] = False
     user: Optional[str] = None
@@ -153,10 +142,11 @@ def prepare_payload(request: ChatCompletionRequest) -> Dict[str, Any]:
     
     messages = []
     for msg in request.messages:
-        if msg.content and msg.content.strip():
+        content = msg.content if msg.content else ""
+        if content and str(content).strip():
             messages.append({
                 "role": msg.role,
-                "content": msg.content
+                "content": str(content)
             })
     
     if not messages:
@@ -168,7 +158,7 @@ def prepare_payload(request: ChatCompletionRequest) -> Dict[str, Any]:
     payload = {"messages": messages}
     
     if request.max_tokens:
-        payload["max_tokens"] = min(request.max_tokens, 2048)
+        payload["max_tokens"] = min(request.max_tokens, 8192)
     if request.temperature is not None:
         payload["temperature"] = request.temperature
     if request.top_p is not None:
@@ -177,15 +167,11 @@ def prepare_payload(request: ChatCompletionRequest) -> Dict[str, Any]:
     return payload
 
 def call_cloudflare_api(model: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Call Cloudflare AI API with better error handling."""
+    """Call Cloudflare AI API."""
     url = f"{BASE_URL}{model}"
     
     try:
         response = requests.post(url, headers=HEADERS, json=payload, timeout=120)
-        
-        # Log for debugging
-        print(f"Status: {response.status_code}")
-        print(f"Response: {response.text[:500]}")
         
         if response.status_code != 200:
             try:
@@ -202,29 +188,8 @@ def call_cloudflare_api(model: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 detail=f"Cloudflare API error: {error_msg}"
             )
         
-        # Parse response
-        try:
-            result = response.json()
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Invalid JSON response from Cloudflare"
-            )
+        return response.json()
         
-        # Check if result is valid
-        if not result:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Empty response from Cloudflare"
-            )
-        
-        return result
-        
-    except requests.exceptions.Timeout:
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Cloudflare API timeout"
-        )
     except requests.exceptions.RequestException as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -237,9 +202,8 @@ def format_response(
     request_id: str,
     created_at: int
 ) -> Dict[str, Any]:
-    """Format Cloudflare response to OpenAI-compatible format with safe checks."""
+    """Format Cloudflare response to OpenAI-compatible format."""
     
-    # Check success
     if not cloudflare_response.get("success", False):
         errors = cloudflare_response.get("errors", [])
         error_msg = errors[0].get("message", "Unknown error") if errors else "Unknown error"
@@ -248,35 +212,9 @@ def format_response(
             detail=error_msg
         )
     
-    # Get result with safe checks
-    result = cloudflare_response.get("result")
-    if result is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="No result in Cloudflare response"
-        )
-    
-    # Get response text with safe check
-    response_text = result.get("response")
-    if response_text is None:
-        response_text = ""
-    
-    # Get usage with safe checks
+    result = cloudflare_response.get("result", {})
+    response_text = result.get("response", "")
     usage_data = result.get("usage", {})
-    if usage_data is None:
-        usage_data = {}
-    
-    prompt_tokens = usage_data.get("prompt_tokens")
-    completion_tokens = usage_data.get("completion_tokens")
-    total_tokens = usage_data.get("total_tokens")
-    
-    # Handle None values
-    if prompt_tokens is None:
-        prompt_tokens = 0
-    if completion_tokens is None:
-        completion_tokens = 0
-    if total_tokens is None:
-        total_tokens = 0
     
     return {
         "id": request_id,
@@ -288,15 +226,15 @@ def format_response(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": response_text
+                    "content": response_text or ""
                 },
                 "finish_reason": "stop"
             }
         ],
         "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens
+            "prompt_tokens": usage_data.get("prompt_tokens", 0) or 0,
+            "completion_tokens": usage_data.get("completion_tokens", 0) or 0,
+            "total_tokens": usage_data.get("total_tokens", 0) or 0
         }
     }
 
@@ -340,14 +278,12 @@ async def list_models():
 async def chat_completions(request: ChatCompletionRequest):
     """OpenAI-compatible chat completions endpoint."""
     
-    # Validate model
     if request.model not in AVAILABLE_MODELS:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Model '{request.model}' not available. Available: {AVAILABLE_MODELS}"
         )
     
-    # Validate messages
     if not request.messages:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -357,9 +293,8 @@ async def chat_completions(request: ChatCompletionRequest):
     request_id = generate_id()
     created_at = get_timestamp()
     
-    payload = prepare_payload(request)
-    
     try:
+        payload = prepare_payload(request)
         cloudflare_response = call_cloudflare_api(request.model, payload)
         formatted = format_response(cloudflare_response, request.model, request_id, created_at)
         return JSONResponse(content=formatted)
