@@ -26,8 +26,15 @@ HEADERS = {
 AVAILABLE_MODELS = [
     "@cf/meta/llama-3.2-1b-instruct",
     "@cf/meta/llama-3.2-3b-instruct",
-    "@cf/meta/llama-3.1-8b-instruct-fp8-fast",
-    "@cf/mistralai/mistral-7b-instruct-v0.1",
+    "@cf/meta/llama-3.1-8b-instruct-awq",
+    "@cf/meta/llama-3-8b-instruct",
+    "@cf/meta/llama-3-8b-instruct-awq",
+    "@cf/meta/llama-2-7b-chat-fp16",
+    "@cf/meta/llama-4-scout-17b-16e-instruct",
+    "@cf/google/gemma-3-12b-it",
+    "@cf/qwen/qwq-32b",
+    "@cf/qwen/qwen2.5-coder-32b-instruct",
+    "@cf/qwen/qwen3-30b-a3b-fp8",
 ]
 
 # ==================== OpenAI-Compatible Schemas ====================
