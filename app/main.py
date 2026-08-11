@@ -27,13 +27,7 @@ AVAILABLE_MODELS = [
     "@cf/meta/llama-3.2-1b-instruct",
     "@cf/meta/llama-3.2-3b-instruct",
     "@cf/meta/llama-3.1-8b-instruct-fp8-fast",
-    "@cf/mistralai/mistral-small-3.1-24b-instruct",
-    "@cf/meta/llama-3.1-70b-instruct-fp8-fast",
-    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-    "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
-    "@cf/zai-org/glm-4.7-flash",
-    "@cf/qwen/qwq-32b",
-    "@cf/qwen/qwen2.5-coder-32b-instruct"
+    "@cf/mistralai/mistral-7b-instruct-v0.1",
 ]
 
 # ==================== OpenAI-Compatible Schemas ====================
