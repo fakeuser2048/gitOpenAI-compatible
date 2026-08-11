@@ -13,8 +13,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== Configuration ====================
-ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
-API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
+ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "8702d5bfa8a2f290dd5fa041a132541f")
+API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "cfut_nnMOYOMizqMPjoVnGxFUBtrlp3mUwlvHSQgX0vpDfb01fb7e")
 BASE_URL = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/run/"
 
 HEADERS = {
@@ -24,16 +24,16 @@ HEADERS = {
 
 # ==================== Available Models ====================
 AVAILABLE_MODELS = [
-    "meta/llama-3.2-1b-instruct",
-    "meta/llama-3.2-3b-instruct",
-    "meta/llama-3.1-8b-instruct-fp8-fast",
-    "mistralai/mistral-small-3.1-24b-instruct",
-    "meta/llama-3.1-70b-instruct-fp8-fast",
-    "meta/llama-3.3-70b-instruct-fp8-fast",
-    "deepseek-ai/deepseek-r1-distill-qwen-32b",
-    "zai-org/glm-4.7-flash",
-    "qwen/qwq-32b",
-    "qwen/qwen2.5-coder-32b-instruct"
+    "@cf/meta/llama-3.2-1b-instruct",
+    "@cf/meta/llama-3.2-3b-instruct",
+    "@cf/meta/llama-3.1-8b-instruct-fp8-fast",
+    "@cf/mistralai/mistral-small-3.1-24b-instruct",
+    "@cf/meta/llama-3.1-70b-instruct-fp8-fast",
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+    "@cf/zai-org/glm-4.7-flash",
+    "@cf/qwen/qwq-32b",
+    "@cf/qwen/qwen2.5-coder-32b-instruct"
 ]
 
 # ==================== OpenAI-Compatible Schemas ====================
@@ -113,7 +113,6 @@ def extract_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if content is not None:
                 formatted_messages.append({"role": role, "content": content})
             elif role == "assistant" and msg.get("tool_calls"):
-                # Handle tool calls
                 formatted_messages.append(msg)
     return formatted_messages
 
@@ -121,24 +120,34 @@ def prepare_payload(request: ChatCompletionRequest) -> Dict[str, Any]:
     """Prepare payload for Cloudflare API."""
     messages = extract_messages(request.messages)
     
+    # Handle system prompt for models that don't support it directly
+    formatted_messages = []
+    system_prompt = None
+    
+    for msg in messages:
+        if msg.get("role") == "system":
+            system_prompt = msg.get("content", "")
+        else:
+            formatted_messages.append(msg)
+    
+    # If system prompt exists, prepend to first user message
+    if system_prompt and formatted_messages:
+        first_user = next((m for m in formatted_messages if m.get("role") == "user"), None)
+        if first_user:
+            first_user["content"] = f"{system_prompt}\n\n{first_user['content']}"
+    
     payload = {
-        "messages": messages
+        "messages": formatted_messages if formatted_messages else messages
     }
     
     if request.max_tokens:
-        payload["max_tokens"] = request.max_tokens
+        payload["max_tokens"] = min(request.max_tokens, 2048)  # Cloudflare limit
     
     if request.temperature is not None:
         payload["temperature"] = request.temperature
     
     if request.top_p is not None:
         payload["top_p"] = request.top_p
-    
-    if request.tools:
-        payload["tools"] = [tool.model_dump() for tool in request.tools]
-    
-    if request.tool_choice:
-        payload["tool_choice"] = request.tool_choice
     
     return payload
 
@@ -147,13 +156,32 @@ def call_cloudflare_api(model: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{BASE_URL}{model}"
     
     try:
-        response = requests.post(url, headers=HEADERS, json=payload, timeout=120)
+        response = requests.post(
+            url,
+            headers=HEADERS,
+            json=payload,
+            timeout=120
+        )
+        
+        if response.status_code == 400:
+            error_detail = response.json().get("errors", [{}])[0].get("message", "Bad Request")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cloudflare API error: {error_detail}"
+            )
+        
         response.raise_for_status()
         return response.json()
+        
     except requests.exceptions.RequestException as e:
+        if hasattr(e, 'response') and e.response is not None:
+            error_msg = e.response.text[:200]
+        else:
+            error_msg = str(e)
+        
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Cloudflare API error: {str(e)}"
+            detail=f"Cloudflare API error: {error_msg}"
         )
 
 def format_response(
@@ -176,7 +204,6 @@ def format_response(
     response_text = result.get("response", "")
     usage_data = result.get("usage", {})
     
-    # Determine finish reason
     finish_reason = "stop"
     if len(response_text) >= (usage_data.get("completion_tokens", 0) * 4):
         finish_reason = "length"
@@ -259,7 +286,6 @@ async def chat_completions(request: ChatCompletionRequest):
     
     # Handle streaming
     if request.stream:
-        # Cloudflare doesn't support streaming natively, so we simulate it
         return await stream_response(request, payload, request_id, created_at)
     
     # Non-streaming response
@@ -288,18 +314,14 @@ async def stream_response(
         cloudflare_response = call_cloudflare_api(request.model, payload)
         result = cloudflare_response.get("result", {})
         response_text = result.get("response", "")
-        usage_data = result.get("usage", {})
         
-        # Chunk the response into words
+        # Split into words for streaming
         words = response_text.split()
-        total_words = len(words)
         
         async def generate():
-            # Send initial chunk
             yield f"data: {json.dumps({'id': request_id, 'object': 'chat.completion.chunk', 'created': created_at, 'model': request.model, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]})}\n\n"
             
-            # Send chunks
-            for i, word in enumerate(words):
+            for word in words:
                 chunk = {
                     "id": request_id,
                     "object": "chat.completion.chunk",
@@ -314,9 +336,8 @@ async def stream_response(
                     ]
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
-                await asyncio.sleep(0.02)  # Small delay
+                await asyncio.sleep(0.02)
             
-            # Send final chunk with usage
             final_chunk = {
                 "id": request_id,
                 "object": "chat.completion.chunk",
@@ -340,8 +361,6 @@ async def stream_response(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Streaming error: {str(e)}"
         )
-
-# ==================== Health Check ====================
 
 @app.get("/health")
 async def health_check():
