@@ -13,8 +13,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== Configuration ====================
-ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "751283466308cea5585a76eeafeb0f54")
-API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "cfut_h6Nq5Mwo2yow9uVBa6PibTr5o6jzvLlTfXQrqBpxed45a0ce")
+ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 BASE_URL = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/run/"
 
 HEADERS = {
