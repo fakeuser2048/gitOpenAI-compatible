@@ -42,28 +42,9 @@ class Message(BaseModel):
     role: str = Field(..., description="Role of the message: system, user, or assistant")
     content: str = Field(..., description="Content of the message")
 
-class ToolCall(BaseModel):
-    id: Optional[str] = None
-    type: str = "function"
-    function: Dict[str, Any]
-
-class ToolCallMessage(BaseModel):
-    role: str = "assistant"
-    content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = None
-
-class FunctionDefinition(BaseModel):
-    name: str
-    description: Optional[str] = None
-    parameters: Optional[Dict[str, Any]] = None
-
-class Tool(BaseModel):
-    type: str = "function"
-    function: FunctionDefinition
-
 class ChatCompletionRequest(BaseModel):
     model: str = Field(..., description="Model to use")
-    messages: List[Union[Message, ToolCallMessage]] = Field(..., description="List of messages")
+    messages: List[Message] = Field(..., description="List of messages")
     temperature: Optional[float] = Field(0.7, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(256, ge=1, le=8192)
     top_p: Optional[float] = Field(1.0, ge=0.0, le=1.0)
@@ -71,8 +52,6 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     frequency_penalty: Optional[float] = Field(0.0, ge=-2.0, le=2.0)
     presence_penalty: Optional[float] = Field(0.0, ge=-2.0, le=2.0)
-    tools: Optional[List[Tool]] = None
-    tool_choice: Optional[Union[str, Dict[str, Any]]] = "auto"
     user: Optional[str] = None
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -96,52 +75,41 @@ class ChatCompletionResponse(BaseModel):
 # ==================== Helper Functions ====================
 
 def generate_id() -> str:
-    """Generate a unique ID for completions."""
     return f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
 def get_timestamp() -> int:
-    """Get current timestamp."""
     return int(time.time())
 
-def extract_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Extract and format messages for Cloudflare API."""
-    formatted_messages = []
-    for msg in messages:
-        if isinstance(msg, dict):
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if content is not None:
-                formatted_messages.append({"role": role, "content": content})
-            elif role == "assistant" and msg.get("tool_calls"):
-                formatted_messages.append(msg)
-    return formatted_messages
-
 def prepare_payload(request: ChatCompletionRequest) -> Dict[str, Any]:
-    """Prepare payload for Cloudflare API."""
-    messages = extract_messages(request.messages)
+    """Prepare payload for Cloudflare API - FIXED VERSION"""
     
-    # Handle system prompt for models that don't support it directly
-    formatted_messages = []
-    system_prompt = None
+    # Extract messages as simple dicts
+    messages = []
     
-    for msg in messages:
-        if msg.get("role") == "system":
-            system_prompt = msg.get("content", "")
-        else:
-            formatted_messages.append(msg)
+    for msg in request.messages:
+        # Skip empty messages
+        if not msg.content or msg.content.strip() == "":
+            continue
+            
+        messages.append({
+            "role": msg.role,
+            "content": msg.content
+        })
     
-    # If system prompt exists, prepend to first user message
-    if system_prompt and formatted_messages:
-        first_user = next((m for m in formatted_messages if m.get("role") == "user"), None)
-        if first_user:
-            first_user["content"] = f"{system_prompt}\n\n{first_user['content']}"
+    # Ensure at least one message exists
+    if not messages:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one non-empty message is required"
+        )
     
     payload = {
-        "messages": formatted_messages if formatted_messages else messages
+        "messages": messages
     }
     
+    # Add optional parameters
     if request.max_tokens:
-        payload["max_tokens"] = min(request.max_tokens, 2048)  # Cloudflare limit
+        payload["max_tokens"] = min(request.max_tokens, 2048)
     
     if request.temperature is not None:
         payload["temperature"] = request.temperature
@@ -163,25 +131,26 @@ def call_cloudflare_api(model: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             timeout=120
         )
         
-        if response.status_code == 400:
-            error_detail = response.json().get("errors", [{}])[0].get("message", "Bad Request")
+        # Check for error response
+        if response.status_code != 200:
+            error_text = response.text
+            try:
+                error_json = response.json()
+                error_msg = error_json.get("errors", [{}])[0].get("message", error_text)
+            except:
+                error_msg = error_text
+            
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cloudflare API error: {error_detail}"
+                status_code=response.status_code,
+                detail=f"Cloudflare API error: {error_msg}"
             )
         
-        response.raise_for_status()
         return response.json()
         
     except requests.exceptions.RequestException as e:
-        if hasattr(e, 'response') and e.response is not None:
-            error_msg = e.response.text[:200]
-        else:
-            error_msg = str(e)
-        
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Cloudflare API error: {error_msg}"
+            detail=f"Cloudflare API error: {str(e)}"
         )
 
 def format_response(
@@ -253,7 +222,6 @@ async def root():
 
 @app.get("/v1/models")
 async def list_models():
-    """List all available models."""
     return {
         "object": "list",
         "data": [
@@ -278,17 +246,29 @@ async def chat_completions(request: ChatCompletionRequest):
             detail=f"Model '{request.model}' not found. Available: {AVAILABLE_MODELS}"
         )
     
+    # Validate messages
+    if not request.messages or len(request.messages) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one message is required"
+        )
+    
+    # Filter out empty messages
+    valid_messages = [msg for msg in request.messages if msg.content and msg.content.strip()]
+    if not valid_messages:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one non-empty message is required"
+        )
+    
+    request.messages = valid_messages
+    
     request_id = generate_id()
     created_at = get_timestamp()
     
     # Prepare payload
     payload = prepare_payload(request)
     
-    # Handle streaming
-    if request.stream:
-        return await stream_response(request, payload, request_id, created_at)
-    
-    # Non-streaming response
     try:
         cloudflare_response = call_cloudflare_api(request.model, payload)
         formatted = format_response(cloudflare_response, request.model, request_id, created_at)
@@ -299,67 +279,6 @@ async def chat_completions(request: ChatCompletionRequest):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Unexpected error: {str(e)}"
-        )
-
-async def stream_response(
-    request: ChatCompletionRequest,
-    payload: Dict[str, Any],
-    request_id: str,
-    created_at: int
-):
-    """Simulate streaming response."""
-    import asyncio
-    
-    try:
-        cloudflare_response = call_cloudflare_api(request.model, payload)
-        result = cloudflare_response.get("result", {})
-        response_text = result.get("response", "")
-        
-        # Split into words for streaming
-        words = response_text.split()
-        
-        async def generate():
-            yield f"data: {json.dumps({'id': request_id, 'object': 'chat.completion.chunk', 'created': created_at, 'model': request.model, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]})}\n\n"
-            
-            for word in words:
-                chunk = {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_at,
-                    "model": request.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": word + " "},
-                            "finish_reason": None
-                        }
-                    ]
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
-                await asyncio.sleep(0.02)
-            
-            final_chunk = {
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": created_at,
-                "model": request.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop"
-                    }
-                ]
-            }
-            yield f"data: {json.dumps(final_chunk)}\n\n"
-            yield "data: [DONE]\n\n"
-        
-        return StreamingResponse(generate(), media_type="text/event-stream")
-    
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Streaming error: {str(e)}"
         )
 
 @app.get("/health")
