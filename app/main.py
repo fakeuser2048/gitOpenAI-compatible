@@ -24,16 +24,16 @@ HEADERS = {
 
 # ==================== Available Models ====================
 AVAILABLE_MODELS = [
-    "meta/llama-3.2-1b-instruct",
-    "meta/llama-3.2-3b-instruct",
-    "meta/llama-3.1-8b-instruct-fp8-fast",
-    "mistralai/mistral-small-3.1-24b-instruct",
-    "meta/llama-3.1-70b-instruct-fp8-fast",
-    "meta/llama-3.3-70b-instruct-fp8-fast",
-    "deepseek-ai/deepseek-r1-distill-qwen-32b",
-    "zai-org/glm-4.7-flash",
-    "qwen/qwq-32b",
-    "qwen/qwen2.5-coder-32b-instruct"
+    "@cf/meta/llama-3.2-1b-instruct",
+    "@cf/meta/llama-3.2-3b-instruct",
+    "@cf/meta/llama-3.1-8b-instruct-fp8-fast",
+    "@cf/mistralai/mistral-small-3.1-24b-instruct",
+    "@cf/meta/llama-3.1-70b-instruct-fp8-fast",
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+    "@cf/zai-org/glm-4.7-flash",
+    "@cf/qwen/qwq-32b",
+    "@cf/qwen/qwen2.5-coder-32b-instruct"
 ]
 
 # ==================== OpenAI-Compatible Schemas ====================
