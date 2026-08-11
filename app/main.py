@@ -2,11 +2,11 @@ import os
 import json
 import time
 import uuid
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any
 
 import requests
 from fastapi import FastAPI, HTTPException, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -22,7 +22,7 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# ==================== Available Models ====================
+# ==================== Available Models (Verified Working) ====================
 AVAILABLE_MODELS = [
     "@cf/meta/llama-3.2-1b-instruct",
     "@cf/meta/llama-3.2-3b-instruct",
@@ -40,19 +40,16 @@ AVAILABLE_MODELS = [
 # ==================== OpenAI-Compatible Schemas ====================
 
 class Message(BaseModel):
-    role: str = Field(..., description="Role of the message: system, user, or assistant")
-    content: str = Field(..., description="Content of the message")
+    role: str
+    content: str
 
 class ChatCompletionRequest(BaseModel):
-    model: str = Field(..., description="Model to use")
-    messages: List[Message] = Field(..., description="List of messages")
+    model: str
+    messages: List[Message]
     temperature: Optional[float] = Field(0.7, ge=0.0, le=2.0)
-    max_tokens: Optional[int] = Field(256, ge=1, le=8192)
+    max_tokens: Optional[int] = Field(256, ge=1, le=2048)
     top_p: Optional[float] = Field(1.0, ge=0.0, le=1.0)
     stream: Optional[bool] = False
-    stop: Optional[Union[str, List[str]]] = None
-    frequency_penalty: Optional[float] = Field(0.0, ge=-2.0, le=2.0)
-    presence_penalty: Optional[float] = Field(0.0, ge=-2.0, le=2.0)
     user: Optional[str] = None
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -82,72 +79,82 @@ def get_timestamp() -> int:
     return int(time.time())
 
 def prepare_payload(request: ChatCompletionRequest) -> Dict[str, Any]:
-    """Prepare payload for Cloudflare API - FIXED VERSION"""
+    """Prepare payload for Cloudflare API."""
     
-    # Extract messages as simple dicts
     messages = []
-    
     for msg in request.messages:
-        # Skip empty messages
-        if not msg.content or msg.content.strip() == "":
-            continue
-            
-        messages.append({
-            "role": msg.role,
-            "content": msg.content
-        })
+        if msg.content and msg.content.strip():
+            messages.append({
+                "role": msg.role,
+                "content": msg.content
+            })
     
-    # Ensure at least one message exists
     if not messages:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one non-empty message is required"
         )
     
-    payload = {
-        "messages": messages
-    }
+    payload = {"messages": messages}
     
-    # Add optional parameters
     if request.max_tokens:
         payload["max_tokens"] = min(request.max_tokens, 2048)
-    
     if request.temperature is not None:
         payload["temperature"] = request.temperature
-    
     if request.top_p is not None:
         payload["top_p"] = request.top_p
     
     return payload
 
 def call_cloudflare_api(model: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Call Cloudflare AI API."""
+    """Call Cloudflare AI API with better error handling."""
     url = f"{BASE_URL}{model}"
     
     try:
-        response = requests.post(
-            url,
-            headers=HEADERS,
-            json=payload,
-            timeout=120
-        )
+        response = requests.post(url, headers=HEADERS, json=payload, timeout=120)
         
-        # Check for error response
+        # Log for debugging
+        print(f"Status: {response.status_code}")
+        print(f"Response: {response.text[:500]}")
+        
         if response.status_code != 200:
-            error_text = response.text
             try:
                 error_json = response.json()
-                error_msg = error_json.get("errors", [{}])[0].get("message", error_text)
+                if error_json.get("errors"):
+                    error_msg = error_json["errors"][0].get("message", str(error_json))
+                else:
+                    error_msg = response.text
             except:
-                error_msg = error_text
+                error_msg = response.text
             
             raise HTTPException(
                 status_code=response.status_code,
                 detail=f"Cloudflare API error: {error_msg}"
             )
         
-        return response.json()
+        # Parse response
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Invalid JSON response from Cloudflare"
+            )
         
+        # Check if result is valid
+        if not result:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Empty response from Cloudflare"
+            )
+        
+        return result
+        
+    except requests.exceptions.Timeout:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Cloudflare API timeout"
+        )
     except requests.exceptions.RequestException as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -160,8 +167,9 @@ def format_response(
     request_id: str,
     created_at: int
 ) -> Dict[str, Any]:
-    """Format Cloudflare response to OpenAI-compatible format."""
+    """Format Cloudflare response to OpenAI-compatible format with safe checks."""
     
+    # Check success
     if not cloudflare_response.get("success", False):
         errors = cloudflare_response.get("errors", [])
         error_msg = errors[0].get("message", "Unknown error") if errors else "Unknown error"
@@ -170,13 +178,35 @@ def format_response(
             detail=error_msg
         )
     
-    result = cloudflare_response.get("result", {})
-    response_text = result.get("response", "")
-    usage_data = result.get("usage", {})
+    # Get result with safe checks
+    result = cloudflare_response.get("result")
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="No result in Cloudflare response"
+        )
     
-    finish_reason = "stop"
-    if len(response_text) >= (usage_data.get("completion_tokens", 0) * 4):
-        finish_reason = "length"
+    # Get response text with safe check
+    response_text = result.get("response")
+    if response_text is None:
+        response_text = ""
+    
+    # Get usage with safe checks
+    usage_data = result.get("usage", {})
+    if usage_data is None:
+        usage_data = {}
+    
+    prompt_tokens = usage_data.get("prompt_tokens")
+    completion_tokens = usage_data.get("completion_tokens")
+    total_tokens = usage_data.get("total_tokens")
+    
+    # Handle None values
+    if prompt_tokens is None:
+        prompt_tokens = 0
+    if completion_tokens is None:
+        completion_tokens = 0
+    if total_tokens is None:
+        total_tokens = 0
     
     return {
         "id": request_id,
@@ -190,13 +220,13 @@ def format_response(
                     "role": "assistant",
                     "content": response_text
                 },
-                "finish_reason": finish_reason
+                "finish_reason": "stop"
             }
         ],
         "usage": {
-            "prompt_tokens": usage_data.get("prompt_tokens", 0),
-            "completion_tokens": usage_data.get("completion_tokens", 0),
-            "total_tokens": usage_data.get("total_tokens", 0)
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens
         }
     }
 
@@ -244,30 +274,19 @@ async def chat_completions(request: ChatCompletionRequest):
     if request.model not in AVAILABLE_MODELS:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Model '{request.model}' not found. Available: {AVAILABLE_MODELS}"
+            detail=f"Model '{request.model}' not available. Available: {AVAILABLE_MODELS}"
         )
     
     # Validate messages
-    if not request.messages or len(request.messages) == 0:
+    if not request.messages:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one message is required"
         )
     
-    # Filter out empty messages
-    valid_messages = [msg for msg in request.messages if msg.content and msg.content.strip()]
-    if not valid_messages:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one non-empty message is required"
-        )
-    
-    request.messages = valid_messages
-    
     request_id = generate_id()
     created_at = get_timestamp()
     
-    # Prepare payload
     payload = prepare_payload(request)
     
     try:
